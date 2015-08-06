@@ -1,0 +1,29 @@
+#!/sbin/runscript
+# Copyright 1999-2015 Gentoo Foundation
+# Distributed under the terms of the GNU General Public License v2
+# $Header: $
+
+NSCAWEB_BIN=/usr/bin/nscaweb
+NSCAWEB_CONFIG=/etc/nscaweb/nscaweb.conf
+
+depend() {
+    need net
+    after icinga2
+}
+
+start() {
+    if [ "${RC_CMD}" = "restart" ];
+    then
+        sleep 10
+    fi
+
+    ebegin "Starting nscaweb"
+    ${NSCAWEB_BIN} start -c ${NSCAWEB_CONFIG}
+    eend $?
+}
+
+stop() {
+    ebegin "Stopping nscaweb"
+    ${NSCAWEB_BIN} stop
+    eend $?
+}
