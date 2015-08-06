@@ -100,7 +100,7 @@ class SubmitListener(threading.Thread):
             time.sleep(0.1)
         self.logger.info("SubmitListener thread stopped.")
     def dump(self,package):
-        '''Using dump, the average package size is calculated prior to submitting it to the Queue.  This is the preferred way for writing data ino SubmitListener.'''
+        '''Using dump, the average package size is calculated prior to submitting it to the Queue.  This is the preferred way for writing data into SubmitListener.'''
         queue_name = self.__queue_name(package['destination'])
 
         #If we don't have a queue like that create a new one

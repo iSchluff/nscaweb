@@ -34,6 +34,7 @@ from nscaweb.server import ThreadControl
 from nscaweb.server import ConfigFileMonitor
 from nscaweb.authentication import Authenticate
 from nscaweb.communication import SubmitListener
+from nscaweb.filter import Filter
 
 from cherrypy import log
 from configobj import ConfigObj
@@ -95,10 +96,11 @@ class WebServer(threading.Thread):
 class HtmlContent():
     '''Class which provides form to accept incoming NSCAweb data.'''
 
-    def __init__(self,queueDefinitions,submitListener,authentication):
+    def __init__(self,queueDefinitions,submitListener,authentication,filter):
         self.queueDefinitions=queueDefinitions
         self.submitListener=submitListener
         self.authentication=authentication
+        self.filter=filter
 
     def index(self,*args,**form):
         pass
@@ -106,47 +108,54 @@ class HtmlContent():
 
     def queue(self,*args,**form):
         try:
-            if form.has_key('username') and form.has_key('password') and form.has_key('input'):
-                if self.authentication.do(username=form['username'],password=form['password']):
-                    form['input']=form['input'].rstrip()
-                    if len(args)==0:
-                        counter=0
-                        for line in form['input'].split('\n'):
-                            counter+=1
-                            #Since this is the broadcast, run over all queues and dump the line in each queue
-                            for name in self.queueDefinitions:
-                                if self.queueDefinitions[name]['enable'] == "1":
-                                    package = self.construct_package(name=name,queueDefinitions=self.queueDefinitions,line=line)
-                                    try:
-                                        self.submitListener.dump(package)
-                                    except Exception:
-                                        logger.warn("Queue size limit reached. Data purged.")
-                                        continue
-                        logger.info("%s items dumped into the broadcast queue for user %s from IP %s."%(counter,form['username'],cherrypy.request.remote.ip))
-                    elif len(args)==1:
-                        if self.queueDefinitions.has_key(args[0]) and self.queueDefinitions[args[0]]['enable'] == "1":
-                            counter=0
-                            for line in form['input'].split('\n'):
-                                counter+=1
-                                package = self.construct_package(name=args[0],queueDefinitions=self.queueDefinitions,line=line)
-                                try:
-                                    self.submitListener.dump(package)
-                                except Exception:
-                                    logger.warn("Queue %s size limit reached. Data discarted."%(args[0]))
-                                    raise cherrypy.HTTPError("500 Internal Server Error", "Queue %s is full. Data discarted."%(args[0]))
-
-                            logger.info("%s items dumped into queue %s for user %s from IP %s."%(counter,args[0],form['username'],cherrypy.request.remote.ip))
-                        else:
-                            logger.warn("Queue %s does not exist or is disabled. Data is purged for user %s from IP %s."%(args[0],form['username'],cherrypy.request.remote.ip))
-                    else:
-                        logger.warn("Malformed url for user %s from IP %s"%(form['username'],cherrypy.request.remote.ip))
-                else:
-                    logger.warn("Access denied for user %s from IP %s."%(form['username'],cherrypy.request.remote.ip))
-            else:
+            if not form.has_key('username') or not form.has_key('password') or not form.has_key('input'):
                 logger.warn("Incomplete data submitted from IP %s."%(cherrypy.request.remote.ip))
+                return
+
+            if not self.authentication.do(username=form['username'],password=form['password']):
+                logger.warn("Access denied for user %s from IP %s."%(form['username'],cherrypy.request.remote.ip))
+                return
+
+            # authenticate user against host
+            form['input'] = form['input'].rstrip()
+            lines = form['input'].split('\n')
+            if self.filter.active:
+                lines = self.filter.apply(lines, form['username'])
+
+            if len(args) == 1:
+                if self.queueDefinitions.has_key(args[0]) and self.queueDefinitions[args[0]]['enable'] == "1":
+                    for line in lines:
+                        package = self.construct_package(name=args[0],queueDefinitions=self.queueDefinitions,line=line)
+                        try:
+                            self.submitListener.dump(package)
+                        except Exception:
+                            logger.warn("Queue %s size limit reached. Data discarded."%(args[0]))
+                            raise cherrypy.HTTPError("500 Internal Server Error", "Queue %s is full. Data discarded."%(args[0]))
+
+                    logger.info("%s items dumped into queue %s for user %s from IP %s."%(len(lines),args[0],form['username'],cherrypy.request.remote.ip))
+                else:
+                    logger.warn("Queue %s does not exist or is disabled. Data is purged for user %s from IP %s."%(args[0],form['username'],cherrypy.request.remote.ip))
+
+            # On Broadcast run over all queues and dump the line in each queue
+            elif len(args) == 0:
+                for line in lines:
+                    for name in self.queueDefinitions:
+                        if self.queueDefinitions[name]['enable'] == "1":
+                            package = self.construct_package(name=name,queueDefinitions=self.queueDefinitions,line=line)
+                            try:
+                                self.submitListener.dump(package)
+                            except Exception:
+                                logger.warn("Queue size limit reached. Data purged.")
+                                continue
+                logger.info("%s items dumped into the broadcast queue for user %s from IP %s."%(len(lines),form['username'],cherrypy.request.remote.ip))
+            else:
+                logger.warn("Malformed url for user %s from IP %s"%(form['username'],cherrypy.request.remote.ip))
+
+
         except cherrypy.HTTPError as err:
             raise cherrypy.HTTPError("500 Internal Server Error", str(err[1]))
         except Exception as error:
+            print error
             logger.warn("Malformed data submitted from IP %s. Maybe something wrong with the destination configuration in the config file."%(cherrypy.request.remote.ip))
     queue.exposed = True
 
@@ -272,7 +281,7 @@ class Server():
     def __init__(self,configfile=None):
         self.configfile=configfile
         try:
-            self.config=ConfigObj(self.configfile)
+            self.config=ConfigObj(self.configfile, encoding='UTF8')
         except Exception as err:
             sys.stderr.write('There appears to be an error in your configfile:\n')
             sys.stderr.write('\t'+ str(type(err))+" "+str(err) + "\n" )
@@ -315,7 +324,7 @@ class Server():
                                         blockcallback=server)
 
         #Create Authentication object
-        auth = Authenticate (   auth_type='default',
+        auth = Authenticate (auth_type='default',
                         database=server.threads['configfilemonitor'].file['authentication'],
                         logger=logger)
 
@@ -324,10 +333,15 @@ class Server():
                                     logger=logger,
                                     blockcallback=server)
 
+        #
+        contentFilter = Filter (config=server.threads['configfilemonitor'].file['filter'],
+                                logger=logger)
+
         #Create an HtmlContent object
-        htmlContent = HtmlContent ( queueDefinitions=server.threads['configfilemonitor'].file['destinations'],
+        htmlContent = HtmlContent (queueDefinitions=server.threads['configfilemonitor'].file['destinations'],
                         submitListener=server.threads['submitListener'],
-                        authentication = auth)
+                        authentication=auth,
+                        filter=contentFilter)
 
         #Start the WebServer thread
         server.threads['webserver'] = WebServer (host=server.threads['configfilemonitor'].file['application']['host'],
